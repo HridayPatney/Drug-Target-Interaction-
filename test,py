@@ -1,0 +1,267 @@
+import os
+import torch
+import numpy as np
+import random
+import time
+from torch.utils.data import DataLoader, Subset
+from model import MultimodalHyperAttentionDTI
+from data_processor import DrugProteinDataset, collate_fn
+from utils import calculate_metrics
+from config import Config
+from tqdm import tqdm
+
+def evaluate_on_subset(model, dataset, criterion, config, subset_percentage=0.001):
+    """
+    Evaluate the model on a random subset of the dataset
+    
+    Args:
+        model: Trained model
+        dataset: Full dataset
+        criterion: Loss function
+        config: Configuration parameters
+        subset_percentage: Percentage of dataset to use (default: 0.1%)
+    
+    Returns:
+        loss: Average loss on subset
+        metrics: Performance metrics on subset
+    """
+    device = torch.device(config.device)
+    model = model.to(device)
+    
+    # Set model to evaluation mode
+    model.eval()
+    
+    # Calculate subset size
+    full_size = len(dataset)
+    subset_size = max(1, int(full_size * subset_percentage))
+    
+    # Randomly select indices
+    subset_indices = random.sample(range(full_size), subset_size)
+    
+    # Create subset and dataloader
+    subset = Subset(dataset, subset_indices)
+    subset_loader = DataLoader(
+        subset,
+        batch_size=min(config.batch_size, subset_size),
+        shuffle=False,
+        num_workers=config.num_workers,
+        collate_fn=collate_fn
+    )
+    
+    # Evaluation variables
+    subset_loss = 0.0
+    y_true = []
+    y_pred = []
+    y_score = []
+    
+    print(f"Evaluating on {subset_size} samples ({subset_percentage*100:.3f}% of dataset)")
+    
+    # Evaluation loop
+    with torch.no_grad():
+        for batch in tqdm(subset_loader, desc="Evaluating"):
+            # Get data
+            drug = batch['drug'].to(device)
+            protein = batch['protein'].to(device)
+            image = batch['image'].to(device)
+            labels = batch['label'].to(device)
+            
+            # Forward pass
+            outputs = model(drug, protein, image)
+            loss = criterion(outputs, labels)
+            
+            # Update statistics
+            subset_loss += loss.item() * drug.size(0)
+            
+            # Get predictions
+            _, predicted = torch.max(outputs, 1)
+            probabilities = torch.softmax(outputs, dim=1)[:, 1]
+            
+            # Collect for metrics calculation
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(predicted.cpu().numpy())
+            y_score.extend(probabilities.cpu().numpy())
+    
+    # Calculate average loss
+    subset_loss = subset_loss / len(subset)
+    
+    # Calculate metrics
+    metrics = calculate_metrics(np.array(y_true), np.array(y_pred), np.array(y_score))
+    
+    return subset_loss, metrics, subset_indices
+
+def calculate_detailed_metrics(y_true, y_pred, y_score):
+    """
+    Calculate detailed metrics for model evaluation
+    
+    Args:
+        y_true: Ground truth labels
+        y_pred: Predicted labels
+        y_score: Prediction scores (probabilities)
+        
+    Returns:
+        Dictionary containing all metrics
+    """
+    from sklearn.metrics import (
+        accuracy_score, precision_score, recall_score, f1_score,
+        roc_auc_score, average_precision_score, matthews_corrcoef,
+        confusion_matrix, classification_report, balanced_accuracy_score,
+        cohen_kappa_score, log_loss
+    )
+    
+    # Basic metrics
+    metrics = {
+        'accuracy': accuracy_score(y_true, y_pred),
+        'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
+        'precision': precision_score(y_true, y_pred, zero_division=0),
+        'recall': recall_score(y_true, y_pred, zero_division=0),
+        'f1': f1_score(y_true, y_pred, zero_division=0),
+        'mcc': matthews_corrcoef(y_true, y_pred),
+        'cohen_kappa': cohen_kappa_score(y_true, y_pred)
+    }
+    
+    # Add ROC AUC if we have both classes
+    if len(np.unique(y_true)) > 1:
+        metrics['roc_auc'] = roc_auc_score(y_true, y_score)
+        metrics['pr_auc'] = average_precision_score(y_true, y_score)
+        metrics['log_loss'] = log_loss(y_true, y_score)
+    
+    # Confusion matrix
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    metrics['true_negatives'] = int(tn)
+    metrics['false_positives'] = int(fp)
+    metrics['false_negatives'] = int(fn)
+    metrics['true_positives'] = int(tp)
+    
+    # Additional metrics
+    metrics['specificity'] = tn / (tn + fp) if (tn + fp) > 0 else 0
+    metrics['npv'] = tn / (tn + fn) if (tn + fn) > 0 else 0  # Negative Predictive Value
+    metrics['sensitivity'] = metrics['recall']  # Sensitivity is the same as recall
+    
+    # Classification report as dictionary
+    report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+    
+    # Add per-class metrics
+    for class_label in sorted(report.keys()):
+        if class_label in ['0', '1', 0, 1]:
+            class_metrics = report[str(class_label)]
+            for metric_name, metric_value in class_metrics.items():
+                if metric_name != 'support':
+                    metrics[f'class_{class_label}_{metric_name}'] = metric_value
+    
+    return metrics
+
+def main():
+    # Load configuration
+    config = Config()
+    
+    # Load dataset
+    data_file = os.path.join(config.data_root, "Davis.txt")
+    full_dataset = DrugProteinDataset(data_file, config)
+    
+    # Load model
+    model = MultimodalHyperAttentionDTI(config)
+    
+    # Check if best model exists
+    model_path = os.path.join(config.checkpoint_dir, 'best_model.pt')
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+    
+    # Load model weights
+    model.load_state_dict(torch.load(model_path, map_location=torch.device(config.device)))
+    print(f"Loaded model from {model_path}")
+    
+    # Define loss function
+    criterion = torch.nn.CrossEntropyLoss()
+    
+    # Evaluate on subset
+    subset_loss, subset_metrics, subset_indices = evaluate_on_subset(
+        model, full_dataset, criterion, config, subset_percentage=0.1
+    )
+    
+    # Calculate detailed metrics
+    y_true = []
+    y_pred = []
+    y_score = []
+    
+    device = torch.device(config.device)
+    model.eval()
+    
+    # Create subset for detailed metrics
+    subset = Subset(full_dataset, subset_indices)
+    subset_loader = DataLoader(
+        subset,
+        batch_size=min(config.batch_size, len(subset_indices)),
+        shuffle=False,
+        num_workers=config.num_workers,
+        collate_fn=collate_fn
+    )
+    
+    # Collect predictions for detailed metrics
+    with torch.no_grad():
+        for batch in subset_loader:
+            drug = batch['drug'].to(device)
+            protein = batch['protein'].to(device)
+            image = batch['image'].to(device)
+            labels = batch['label'].to(device)
+            
+            outputs = model(drug, protein, image)
+            _, predicted = torch.max(outputs, 1)
+            probabilities = torch.softmax(outputs, dim=1)[:, 1]
+            
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(predicted.cpu().numpy())
+            y_score.extend(probabilities.cpu().numpy())
+    
+    # Calculate detailed metrics
+    detailed_metrics = calculate_detailed_metrics(
+        np.array(y_true), np.array(y_pred), np.array(y_score)
+    )
+    
+    # Print results
+    print("\nSubset Evaluation Results:")
+    print(f"Loss: {subset_loss:.4f}")
+    print("\nBasic Metrics:")
+    for metric_name, metric_value in subset_metrics.items():
+        print(f"  {metric_name}: {metric_value:.4f}")
+    
+    print("\nDetailed Metrics:")
+    for metric_name, metric_value in detailed_metrics.items():
+        if isinstance(metric_value, (int, float)):
+            print(f"  {metric_name}: {metric_value:.4f}")
+        else:
+            print(f"  {metric_name}: {metric_value}")
+    
+    # Save results to file
+    results = {
+        'subset_size': len(subset_indices),
+        'subset_loss': subset_loss,
+        'subset_metrics': subset_metrics,
+        'detailed_metrics': detailed_metrics,
+        'subset_indices': subset_indices
+    }
+    
+    import json
+    with open(os.path.join(config.log_dir, 'subset_evaluation.json'), 'w') as f:
+        # Convert numpy values to native Python types for JSON serialization
+        results_serializable = {
+            'subset_size': results['subset_size'],
+            'subset_loss': float(results['subset_loss']),
+            'subset_metrics': {k: float(v) for k, v in results['subset_metrics'].items()},
+            'detailed_metrics': {k: float(v) if isinstance(v, (int, float, np.number)) else v 
+                                for k, v in results['detailed_metrics'].items()},
+            'subset_indices': [int(idx) for idx in results['subset_indices']]
+        }
+        json.dump(results_serializable, f, indent=4)
+    
+    print(f"\nResults saved to {os.path.join(config.log_dir, 'subset_evaluation.json')}")
+
+if __name__ == "__main__":
+    # Set seeds for reproducibility
+    seed = int(time.time()) % 10000  # Use current time for different seeds each run
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    
+    print(f"Random seed: {seed}")
+    main()
